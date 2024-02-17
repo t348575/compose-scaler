@@ -28,6 +28,7 @@ use crate::config::{self, Args};
 const UNHEALTHY_NO_LOG: &str = "container is unhealthy: no log available";
 const DEAD_STATE: &str = "container in dead state";
 const DEFAULT_COMMAND: &str = "docker compose";
+const SESSION_CHANNEL_OPEN_ERR: &str = "Could not open session channel";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -122,7 +123,7 @@ pub struct ProjectManager {
     docker: Docker,
     this: Option<SharedProjectManager>,
     session: Session,
-    project_dir: String,
+    c: config::Config
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,7 +155,26 @@ impl ProjectManager {
         )
         .expect("Could not parse config file");
 
-        let tcp = TcpStream::connect(c.ssh_host).unwrap();
+        let session = Self::connect_ssh(&c);
+
+        let pm = ProjectManager {
+            docker,
+            projects: HashMap::new(),
+            this: None,
+            session,
+            c: c.clone()
+        };
+
+        for p in c.initial_projects {
+            pm.stop_project(&p, "docker compose")
+                .await
+                .expect(&format!("Could not stop project {p}"));
+        }
+        pm
+    }
+
+    fn connect_ssh(c: &config::Config) -> Session {
+        let tcp = TcpStream::connect(c.ssh_host.clone()).unwrap();
         let mut session = Session::new().unwrap();
         session.set_tcp_stream(tcp);
         session.handshake().unwrap();
@@ -168,21 +188,7 @@ impl ProjectManager {
             )
             .unwrap();
         assert!(session.authenticated());
-
-        let pm = ProjectManager {
-            docker,
-            projects: HashMap::new(),
-            this: None,
-            session,
-            project_dir: c.projects_dir,
-        };
-
-        for p in c.initial_projects {
-            pm.stop_project(&p, "docker compose")
-                .await
-                .expect(&format!("Could not stop project {p}"));
-        }
-        pm
+        session
     }
 
     pub fn set_this(&mut self, self_instance: SharedProjectManager) {
@@ -242,8 +248,17 @@ impl ProjectManager {
         custom_command: Option<String>,
     ) -> Result<(), ProjectError> {
         let mut m = this.write().await;
-        m.start_project(&name, &custom_command.unwrap_or(DEFAULT_COMMAND.to_owned()))
-            .await?;
+
+        let cmd = custom_command.unwrap_or(DEFAULT_COMMAND.to_owned());
+        for i in 0..3 {
+            if let Err(err) = m.start_project(&name, &cmd).await {
+                if i == 3 {
+                    return Err(err);
+                }
+            } else {
+                break;
+            }
+        }
 
         if let Some(p) = m.projects.get_mut(&name) {
             if !already_exists {
@@ -312,9 +327,12 @@ impl ProjectManager {
         }
     }
 
-    async fn start_project(&self, name: &str, command: &str) -> Result<(), ProjectError> {
+    async fn start_project(&mut self, name: &str, command: &str) -> Result<(), ProjectError> {
         if let Err(err) = self.exec_command(name, &format!("{command} up -d")) {
-            return Err(ProjectError::StartError(err.to_owned()));
+            match err {
+                SESSION_CHANNEL_OPEN_ERR => self.session = Self::connect_ssh(&self.c),
+                _ => return Err(ProjectError::StartError(err.to_owned()))
+            }
         }
         Ok(())
     }
@@ -419,9 +437,9 @@ impl ProjectManager {
         let mut channel = self
             .session
             .channel_session()
-            .map_err(|_| "Could not open session channel")?;
+            .map_err(|_| SESSION_CHANNEL_OPEN_ERR)?;
         channel
-            .exec(&format!("cd {}/{dir} && {command}", self.project_dir))
+            .exec(&format!("cd {}/{dir} && {command}", self.c.projects_dir))
             .map_err(|_| "Could not execute command")?;
         let mut s = String::new();
         channel

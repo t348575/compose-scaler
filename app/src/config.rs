@@ -14,7 +14,7 @@ pub struct Args {
     pub config_file: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub ssh_host: String,
     pub ssh_username: String,
