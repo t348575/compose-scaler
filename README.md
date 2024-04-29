@@ -1,4 +1,4 @@
-# compose-scaler ![Visits](https://nkvnu62257.execute-api.ap-south-1.amazonaws.com/production?repo=compose-scaler)
+# compose-scaler ![Visits](https://xn4nc029ta.execute-api.ap-south-1.amazonaws.com/default/repo-view-counter?repo=compose-scaler)
 Start and stop (delete) docker compose projects on demand through traefik. Heavily inspired by [sablier](https://github.com/acouvreur/sablier).
 
 ## Getting started
