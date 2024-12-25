@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+	"strings"
 )
 
 type Config struct {
@@ -26,6 +27,11 @@ func CreateConfig() *Config {
 		RefreshFrequency: "5s",
 		CustomCommand:    nil,
 	}
+}
+
+func ToTitle(str string) string {
+    letters := strings.Split(str, "")
+    return strings.ToUpper(letters[0]) + strings.Join(letters[1:], "")
 }
 
 func (c *Config) BuildRequest(middlewareName string) (*http.Request, error) {
@@ -60,7 +66,7 @@ func (c *Config) BuildRequest(middlewareName string) (*http.Request, error) {
 		q.Add("display_name", c.DisplayName)
 	} else {
 		// display name defaults as middleware name
-		q.Add("display_name", middlewareName)
+		q.Add("display_name", ToTitle(c.Name))
 	}
 
 	if c.Theme == "" {
