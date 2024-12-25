@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use clap::Parser;
 use config::Args;
 use lazy_static::lazy_static;
-use sessions::{Config, SharedProjectManager};
+use sessions::{Config, OverrideCommand, SharedProjectManager};
 use tera::{Context, Tera};
 use tokio::{signal, sync::RwLock};
 use tracing::{debug, error};
@@ -35,8 +35,13 @@ async fn main() {
 
     let state = Arc::new(RwLock::new(pm));
     state.write().await.set_this(state.clone());
+
+    let api_router = Router::new()
+        .route("/scale", get(api_handler))
+        .route("/override/:project/:scale", post(scale_commands));
+
     let app = Router::new()
-        .route("/api", get(api_handler))
+        .nest("/api", api_router)
         .route("/projects", get(project_handler))
         .with_state(state);
 
@@ -68,6 +73,10 @@ async fn api_handler(
 ) -> impl IntoResponse {
     debug!("{config:#?}");
 
+    if manager.read().await.has_override(&config.name) {
+        return (StatusCode::CONFLICT, "Project has an override").into_response();
+    }
+
     match manager.write().await.add_and_start(config.clone()).await {
         Ok((s, instance_states)) => match s {
             sessions::Status::Running => (
@@ -90,6 +99,22 @@ async fn api_handler(
                 Html(theme).into_response()
             }
         },
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+async fn scale_commands(
+    Path((project, override_command)): Path<(String, OverrideCommand)>,
+    State(manager): State<SharedProjectManager>,
+) -> impl IntoResponse {
+    debug!("{project} {override_command:?}");
+    let res = manager
+        .write()
+        .await
+        .override_command(project, override_command)
+        .await;
+    match res {
+        Ok(()) => StatusCode::OK.into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
 }
@@ -118,6 +143,7 @@ async fn shutdown_signal() {
 struct Project {
     config: Config,
     last_invoke: u128,
+    scale_override: bool,
     instance_states: Vec<sessions::ContainerStatus>,
     status: sessions::Status,
 }

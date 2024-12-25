@@ -31,15 +31,88 @@ const DEFAULT_COMMAND: &str = "docker compose";
 const SESSION_CHANNEL_OPEN_ERR: &str = "Could not open session channel";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(from = "ParseConfig", into = "ParseConfig")]
 pub struct Config {
-    name: String,
+    pub name: String,
     display_name: String,
-    #[serde(deserialize_with = "parse_into_duration")]
+    #[serde(
+        deserialize_with = "parse_into_duration",
+        default = "default_session_duration"
+    )]
     session_duration: Duration,
+    #[serde(default = "default_theme")]
     pub theme: String,
-    #[serde(deserialize_with = "parse_into_duration")]
+    #[serde(
+        deserialize_with = "parse_into_duration",
+        default = "default_refresh_frequency"
+    )]
     refresh_frequency: Duration,
     custom_command: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ParseConfig {
+    name: String,
+    display_name: Option<String>,
+    #[serde(
+        deserialize_with = "parse_into_duration",
+        default = "default_session_duration"
+    )]
+    session_duration: Duration,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(
+        deserialize_with = "parse_into_duration",
+        default = "default_refresh_frequency"
+    )]
+    refresh_frequency: Duration,
+    custom_command: Option<String>,
+}
+
+fn capitalize_first(s: &str) -> String {
+    s.chars()
+        .take(1)
+        .flat_map(|f| f.to_uppercase())
+        .chain(s.chars().skip(1))
+        .collect()
+}
+
+impl From<ParseConfig> for Config {
+    fn from(value: ParseConfig) -> Self {
+        Config {
+            name: value.name.clone(),
+            display_name: value.display_name.unwrap_or(capitalize_first(&value.name)),
+            session_duration: value.session_duration,
+            theme: value.theme,
+            refresh_frequency: value.refresh_frequency,
+            custom_command: value.custom_command,
+        }
+    }
+}
+
+impl From<Config> for ParseConfig {
+    fn from(value: Config) -> Self {
+        ParseConfig {
+            name: value.name,
+            display_name: Some(value.display_name),
+            session_duration: value.session_duration,
+            theme: value.theme,
+            refresh_frequency: value.refresh_frequency,
+            custom_command: value.custom_command,
+        }
+    }
+}
+
+fn default_theme() -> String {
+    "ghost".to_owned()
+}
+
+fn default_session_duration() -> Duration {
+    Duration::from_secs(600)
+}
+
+fn default_refresh_frequency() -> Duration {
+    Duration::from_secs(5)
 }
 
 impl Config {
@@ -50,6 +123,12 @@ impl Config {
             &human_duration(self.session_duration.as_millis()),
         );
         ctx.insert("refresh_frequency", &self.refresh_frequency.as_secs());
+    }
+
+    fn command(&self) -> String {
+        self.custom_command
+            .clone()
+            .unwrap_or(DEFAULT_COMMAND.to_owned())
     }
 }
 
@@ -78,8 +157,16 @@ fn human_duration(dur: u128) -> String {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub enum OverrideCommand {
+    Start,
+    Stop,
+    Clear,
+}
+
 #[derive(Debug)]
 struct Project {
+    scale_override: bool,
     config: Config,
     last_invoke: Instant,
     handle: Option<JoinHandle<()>>,
@@ -108,6 +195,7 @@ pub enum ContainerStateStatus {
 impl Project {
     fn new(config: Config) -> Project {
         Project {
+            scale_override: false,
             config,
             handle: None,
             last_invoke: Instant::now(),
@@ -123,7 +211,7 @@ pub struct ProjectManager {
     docker: Docker,
     this: Option<SharedProjectManager>,
     session: Session,
-    c: config::Config
+    c: config::Config,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +231,8 @@ pub enum ProjectError {
     ListError(String),
     #[error("Could not inspect container: {0}")]
     InspectError(String),
+    #[error("Could not override project: {0}")]
+    OverrrideError(String),
 }
 
 impl ProjectManager {
@@ -157,20 +247,50 @@ impl ProjectManager {
 
         let session = Self::connect_ssh(&c);
 
-        let pm = ProjectManager {
+        let mut pm = ProjectManager {
             docker,
             projects: HashMap::new(),
             this: None,
             session,
-            c: c.clone()
+            c: c.clone(),
         };
 
-        for p in c.initial_projects {
-            pm.stop_project(&p, "docker compose")
-                .await
-                .expect(&format!("Could not stop project {p}"));
+        for c in c.projects {
+            if let Ok(statuses) = pm.status_project(&c.name, &c.command()).await {
+                let is_not_running = statuses.len() == 0 || statuses.iter().any(|x| !x.running);
+                pm.projects.insert(
+                    c.name.clone(),
+                    Project {
+                        scale_override: false,
+                        config: c,
+                        last_invoke: if is_not_running {
+                            Instant::now() - Duration::from_secs(86400)
+                        } else {
+                            Instant::now()
+                        },
+                        handle: None,
+                        instance_states: statuses,
+                        status: if is_not_running {
+                            Status::NotRunning
+                        } else {
+                            Status::Running
+                        },
+                    },
+                );
+            } else {
+                error!(
+                    "Could not get status for project {} during initialization",
+                    c.name
+                );
+            }
         }
         pm
+    }
+
+    pub fn has_override(&self, project: &str) -> bool {
+        self.projects
+            .get(project)
+            .map_or(false, |p| p.scale_override)
     }
 
     fn connect_ssh(c: &config::Config) -> Session {
@@ -195,17 +315,43 @@ impl ProjectManager {
         self.this = Some(self_instance)
     }
 
+    pub async fn override_command(
+        &mut self,
+        project: String,
+        command: OverrideCommand,
+    ) -> Result<(), ProjectError> {
+        if let Some(p) = self.projects.get_mut(&project) {
+            match command {
+                OverrideCommand::Start => {
+                    p.scale_override = true;
+                    self.add_and_start(self.projects.get(&project).unwrap().config.clone())
+                        .await?;
+                }
+                OverrideCommand::Stop => {
+                    p.scale_override = true;
+                    p.status = Status::NotRunning;
+                    let cmd = self.projects.get(&project).unwrap().config.command();
+                    if let Err(err) = self.stop_project(&project, &cmd).await {
+                        error!("(When stopping for idling) {err}");
+                    }
+                }
+                OverrideCommand::Clear => p.scale_override = false,
+            }
+            Ok(())
+        } else {
+            return Err(ProjectError::OverrrideError("Project not found".to_owned()));
+        }
+    }
+
     pub async fn add_and_start(
         &mut self,
         config: Config,
     ) -> Result<(Status, Vec<ContainerStatus>), ProjectError> {
-        let mut already_exists = true;
         let project = if self.projects.contains_key(&config.name) {
             let item = self.projects.get_mut(&config.name).unwrap();
             item.config = config.clone();
             item
         } else {
-            already_exists = false;
             self.projects
                 .insert(config.name.clone(), Project::new(config.clone()));
             self.projects.get_mut(&config.name).unwrap()
@@ -217,13 +363,8 @@ impl ProjectManager {
             let pc = self.this.clone().unwrap();
             let name = config.name.clone();
             spawn(async move {
-                if let Err(err) = Self::start_project_sequence(
-                    name.clone(),
-                    pc.clone(),
-                    already_exists,
-                    config.custom_command,
-                )
-                .await
+                if let Err(err) =
+                    Self::start_project_sequence(name.clone(), pc.clone(), config).await
                 {
                     error!("Could not startup project: {err}");
 
@@ -244,12 +385,11 @@ impl ProjectManager {
     async fn start_project_sequence(
         name: String,
         this: SharedProjectManager,
-        already_exists: bool,
-        custom_command: Option<String>,
+        config: Config,
     ) -> Result<(), ProjectError> {
         let mut m = this.write().await;
 
-        let cmd = custom_command.unwrap_or(DEFAULT_COMMAND.to_owned());
+        let cmd = config.command();
         for i in 0..3 {
             if let Err(err) = m.start_project(&name, &cmd).await {
                 if i == 3 {
@@ -260,17 +400,30 @@ impl ProjectManager {
             }
         }
 
-        if let Some(p) = m.projects.get_mut(&name) {
-            if !already_exists {
-                let this_c = this.clone();
-                let name_c = name.clone();
-                let handle = spawn(async move {
-                    Self::manage_project(name_c, this_c).await;
-                });
-                p.handle = Some(handle);
-            }
-            p.status = Status::Running;
+        let p = m.projects.get_mut(&name);
+        if p.is_none() {
+            return Err(ProjectError::StartError("Project not found".to_owned()));
         }
+        let p = p.unwrap();
+        let this_c = this.clone();
+        let name_c = name.clone();
+
+        let start_and_set_handle = |p: &mut Project| {
+            let handle = spawn(async move {
+                Self::manage_project(name_c, this_c).await;
+            });
+            p.handle = Some(handle);
+        };
+
+        match p.handle.as_ref() {
+            Some(h) => {
+                if h.is_finished() {
+                    start_and_set_handle(p);
+                }
+            }
+            None => start_and_set_handle(p),
+        }
+        p.status = Status::Running;
         Ok(())
     }
 
@@ -283,18 +436,20 @@ impl ProjectManager {
                 None => break,
             };
 
-            let custom_command = p
-                .config
-                .custom_command
-                .clone()
-                .unwrap_or(DEFAULT_COMMAND.to_owned());
+            let custom_command = p.config.command();
             let sleep_for = p.config.refresh_frequency;
 
+            if p.scale_override {
+                drop(project_manager);
+                sleep(sleep_for).await;
+                continue;
+            }
+
             if p.last_invoke.elapsed() >= p.config.session_duration {
+                p.status = Status::NotRunning;
                 if let Err(err) = project_manager.stop_project(&name, &custom_command).await {
                     error!("(When stopping for idling) {err}");
                 }
-                _ = project_manager.projects.remove(&name);
                 break;
             } else {
                 match project_manager.status_project(&name, &custom_command).await {
@@ -331,7 +486,7 @@ impl ProjectManager {
         if let Err(err) = self.exec_command(name, &format!("{command} up -d")) {
             match err {
                 SESSION_CHANNEL_OPEN_ERR => self.session = Self::connect_ssh(&self.c),
-                _ => return Err(ProjectError::StartError(err.to_owned()))
+                _ => return Err(ProjectError::StartError(err.to_owned())),
             }
         }
         Ok(())
@@ -426,6 +581,7 @@ impl ProjectManager {
             .iter()
             .map(|(_, p)| super::Project {
                 config: p.config.clone(),
+                scale_override: p.scale_override,
                 last_invoke: p.last_invoke.elapsed().as_millis(),
                 instance_states: p.instance_states.clone(),
                 status: p.status.clone(),

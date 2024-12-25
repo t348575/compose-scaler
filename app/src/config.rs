@@ -21,5 +21,5 @@ pub struct Config {
     pub projects_dir: String,
     pub public_key: String,
     pub private_key: String,
-    pub initial_projects: Vec<String>,
+    pub projects: Vec<crate::sessions::Config>,
 }

@@ -37,7 +37,7 @@ func (c *Config) BuildRequest(middlewareName string) (*http.Request, error) {
 		return nil, fmt.Errorf("You cannot have an empty project name")
 	}
 
-	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api", c.ComposeScalerURL), nil)
+	request, err := http.NewRequest("GET", fmt.Sprintf("%s/api/scale", c.ComposeScalerURL), nil)
 	if err != nil {
 		return nil, err
 	}

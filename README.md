@@ -1,4 +1,4 @@
-# compose-scaler ![Visits](https://nkvnu62257.execute-api.ap-south-1.amazonaws.com/production?repo=compose-scaler)
+# compose-scaler ![Visits](https://https://lambda.348575.xyz/repo-view-counter?repo=compose-scaler)
 Start and stop (delete) docker compose projects on demand through traefik. Heavily inspired by [sablier](https://github.com/acouvreur/sablier).
 
 ## Getting started
@@ -35,19 +35,22 @@ services:
 ```
 
 * Sample compose-scaler config:
+Confiugration for projects here is compulsory, but not in the traefik middlewares file. Only name is compulsory, all other fields have defaults.
 ```yaml
 ssh_host: my_host:22
 ssh_username: my_user
 projects_dir: /path/on/host/to/compose/projects
 public_key: /compose_scaler_key.pub
 private_key: /compose_scaler_key
-initial_projects:
-  - gitea
-  - dockge
-  - obsidian-zola
-  - obsidian-livesync
-  - overleaf
-  - any_other_project
+projects:
+  - name: gitea
+    name: dockge # this must match the folder name inside your compose projects directory
+    displayName: Dockge # displayed on the waiting page
+    refreshFrequency: 5s # how often to refresh status, etc.
+    sessionDuration: 5m # time before running docker compose down
+    # if required, pass a path to a custom docker compose, eg. overleaf uses one
+    # the default is "docker compose"
+    customCommand: bin/docker-compose
 ```
 
 * Expected compose projects directory structure:
@@ -62,6 +65,7 @@ initial_projects:
 ```
 
 * Sample traefik middleware config:
+This configuration is not compulsory, only the name is compulsory here. It overrides any configuration set in the compose scaler config yaml.
 ```yaml
 http:
   middlewares:

@@ -3,7 +3,7 @@ USER root
 RUN cargo install cargo-chef
 WORKDIR /app
 
-FROM chef as planner
+FROM chef AS planner
 WORKDIR /compose-scaler
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
