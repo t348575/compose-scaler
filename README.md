@@ -1,4 +1,4 @@
-# compose-scaler ![Visits](https://https://lambda.348575.xyz/repo-view-counter?repo=compose-scaler)
+# compose-scaler ![Visits](https://lambda.348575.xyz/repo-view-counter?repo=compose-scaler)
 Start and stop (delete) docker compose projects on demand through traefik. Heavily inspired by [sablier](https://github.com/acouvreur/sablier).
 
 ## Getting started
