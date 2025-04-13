@@ -73,7 +73,9 @@ async fn api_handler(
 ) -> impl IntoResponse {
     debug!("{config:#?}");
 
-    if manager.read().await.has_override(&config.name) {
+    if manager.read().await.has_override(&config.name)
+        && !manager.read().await.is_running(&config.name)
+    {
         return (StatusCode::CONFLICT, "Project has an override").into_response();
     }
 

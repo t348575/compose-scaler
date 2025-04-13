@@ -214,7 +214,7 @@ pub struct ProjectManager {
     c: config::Config,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum Status {
     Running,
     NotRunning,
@@ -293,6 +293,12 @@ impl ProjectManager {
             .map_or(false, |p| p.scale_override)
     }
 
+    pub fn is_running(&self, project: &str) -> bool {
+        self.projects
+            .get(project)
+            .map_or(false, |p| p.status == Status::Running)
+    }
+
     fn connect_ssh(c: &config::Config) -> Session {
         let tcp = TcpStream::connect(c.ssh_host.clone()).unwrap();
         let mut session = Session::new().unwrap();
@@ -335,7 +341,15 @@ impl ProjectManager {
                         error!("(When stopping for idling) {err}");
                     }
                 }
-                OverrideCommand::Clear => p.scale_override = false,
+                OverrideCommand::Clear => {
+                    p.scale_override = false;
+                    if let Status::NotRunning = p.status {
+                        p.last_invoke = Instant::now() - (p.config.session_duration * 2);
+                        if let Some(h) = p.handle.take() {
+                            h.abort();
+                        }
+                    }
+                }
             }
             Ok(())
         } else {
