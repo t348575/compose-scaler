@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use deserialize_form_style_query_parameter::option_form_vec_deserialize;
 use bollard::{
     service::{ContainerStateStatusEnum, HealthStatusEnum},
     Docker,
@@ -34,18 +35,10 @@ const SESSION_CHANNEL_OPEN_ERR: &str = "Could not open session channel";
 #[serde(from = "ParseConfig", into = "ParseConfig")]
 pub struct Config {
     pub name: String,
+    only: Vec<String>,
     display_name: String,
-    #[serde(
-        deserialize_with = "parse_into_duration",
-        default = "default_session_duration"
-    )]
     session_duration: Duration,
-    #[serde(default = "default_theme")]
     pub theme: String,
-    #[serde(
-        deserialize_with = "parse_into_duration",
-        default = "default_refresh_frequency"
-    )]
     refresh_frequency: Duration,
     custom_command: Option<String>,
 }
@@ -53,6 +46,8 @@ pub struct Config {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ParseConfig {
     name: String,
+    #[serde(deserialize_with = "option_form_vec_deserialize", default)]
+    only: Option<Vec<String>>,
     display_name: Option<String>,
     #[serde(
         deserialize_with = "parse_into_duration",
@@ -86,6 +81,7 @@ impl From<ParseConfig> for Config {
             theme: value.theme,
             refresh_frequency: value.refresh_frequency,
             custom_command: value.custom_command,
+            only: value.only.unwrap_or_default(),
         }
     }
 }
@@ -99,6 +95,7 @@ impl From<Config> for ParseConfig {
             theme: value.theme,
             refresh_frequency: value.refresh_frequency,
             custom_command: value.custom_command,
+            only: if value.only.is_empty() { None } else { Some(value.only) },
         }
     }
 }
@@ -256,7 +253,7 @@ impl ProjectManager {
         };
 
         for c in c.projects {
-            if let Ok(statuses) = pm.status_project(&c.name, &c.command()).await {
+            if let Ok(statuses) = pm.status_project(&c.name, &c.command(), &c.only).await {
                 let is_not_running = statuses.len() == 0 || statuses.iter().any(|x| !x.running);
                 pm.projects.insert(
                     c.name.clone(),
@@ -336,8 +333,8 @@ impl ProjectManager {
                 OverrideCommand::Stop => {
                     p.scale_override = true;
                     p.status = Status::NotRunning;
-                    let cmd = self.projects.get(&project).unwrap().config.command();
-                    if let Err(err) = self.stop_project(&project, &cmd).await {
+                    let c = &self.projects.get(&project).unwrap().config;
+                    if let Err(err) = self.stop_project(&project, &c.command(), &c.only).await {
                         error!("(When stopping for idling) {err}");
                     }
                 }
@@ -405,7 +402,7 @@ impl ProjectManager {
 
         let cmd = config.command();
         for i in 0..3 {
-            if let Err(err) = m.start_project(&name, &cmd).await {
+            if let Err(err) = m.start_project(&name, &cmd, &config.only).await {
                 if i == 3 {
                     return Err(err);
                 }
@@ -452,6 +449,7 @@ impl ProjectManager {
 
             let custom_command = p.config.command();
             let sleep_for = p.config.refresh_frequency;
+            let only = p.config.only.clone();
 
             if p.scale_override {
                 drop(project_manager);
@@ -461,18 +459,24 @@ impl ProjectManager {
 
             if p.last_invoke.elapsed() >= p.config.session_duration {
                 p.status = Status::NotRunning;
-                if let Err(err) = project_manager.stop_project(&name, &custom_command).await {
+                if let Err(err) = project_manager
+                    .stop_project(&name, &custom_command, &only)
+                    .await
+                {
                     error!("(When stopping for idling) {err}");
                 }
                 break;
             } else {
-                match project_manager.status_project(&name, &custom_command).await {
+                match project_manager
+                    .status_project(&name, &custom_command, &only)
+                    .await
+                {
                     Ok(statuses) => {
-                        debug!("{statuses:?}");
                         if statuses.len() == 0 || statuses.iter().position(|x| !x.running).is_some()
                         {
-                            if let Err(err) =
-                                project_manager.start_project(&name, &custom_command).await
+                            if let Err(err) = project_manager
+                                .start_project(&name, &custom_command, &only)
+                                .await
                             {
                                 error!("(When restarting) {err}")
                             } else {
@@ -496,8 +500,13 @@ impl ProjectManager {
         }
     }
 
-    async fn start_project(&mut self, name: &str, command: &str) -> Result<(), ProjectError> {
-        if let Err(err) = self.exec_command(name, &format!("{command} up -d")) {
+    async fn start_project(
+        &mut self,
+        name: &str,
+        command: &str,
+        only: &[String],
+    ) -> Result<(), ProjectError> {
+        if let Err(err) = self.exec_command(name, &format!("{command} up -d {}", only.join(" "))) {
             match err {
                 SESSION_CHANNEL_OPEN_ERR => self.session = Self::connect_ssh(&self.c),
                 _ => return Err(ProjectError::StartError(err.to_owned())),
@@ -506,8 +515,13 @@ impl ProjectManager {
         Ok(())
     }
 
-    async fn stop_project(&self, name: &str, command: &str) -> Result<(), ProjectError> {
-        if let Err(err) = self.exec_command(name, &format!("{command} down")) {
+    async fn stop_project(
+        &self,
+        name: &str,
+        command: &str,
+        only: &[String],
+    ) -> Result<(), ProjectError> {
+        if let Err(err) = self.exec_command(name, &format!("{command} down {}", only.join(" "))) {
             return Err(ProjectError::StopError(err.to_owned()));
         }
         Ok(())
@@ -517,8 +531,9 @@ impl ProjectManager {
         &self,
         name: &str,
         command: &str,
+        only: &[String],
     ) -> Result<Vec<ContainerStatus>, ProjectError> {
-        match self.exec_command(name, &format!("{command} ps -q")) {
+        match self.exec_command(name, &format!("{command} ps -q {}", only.join(" "))) {
             Ok(output) => {
                 let mut statuses = Vec::new();
                 for item in output.split('\n') {
@@ -529,7 +544,10 @@ impl ProjectManager {
 
                     let status = self
                         .docker
-                        .inspect_container(item, None)
+                        .inspect_container(
+                            item,
+                            None::<bollard::query_parameters::InspectContainerOptions>,
+                        )
                         .await
                         .map_err(|x| ProjectError::InspectError(x.to_string()))?;
 

@@ -1,11 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
-    response::{Html, IntoResponse},
-    routing::{get, post},
-    Router,
+    Router, extract::{Path, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::{get, post}
 };
 use clap::Parser;
 use config::Args;
@@ -25,7 +21,7 @@ mod sessions;
 async fn main() {
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_env("LOG"))
+        .with(EnvFilter::from_env("LOG").add_directive("bollard=warn".parse().unwrap()))
         .init();
 
     let args = Args::parse();
@@ -38,7 +34,7 @@ async fn main() {
 
     let api_router = Router::new()
         .route("/scale", get(api_handler))
-        .route("/override/:project/:scale", post(scale_commands));
+        .route("/override/{project}/{scale}", post(scale_commands));
 
     let app = Router::new()
         .nest("/api", api_router)
@@ -72,7 +68,6 @@ async fn api_handler(
     State(manager): State<SharedProjectManager>,
 ) -> impl IntoResponse {
     debug!("{config:#?}");
-
     if manager.read().await.has_override(&config.name)
         && !manager.read().await.is_running(&config.name)
     {

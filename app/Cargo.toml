@@ -6,10 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-axum = { version = "0.7", features = ["http2"] }
-bollard = "0.18"
+axum = { version = "0.8", features = ["http2", "query", "json"] }
+bollard = "0.19"
 clap = { version = "4.4", features = ["derive"] }
-hashbrown = "0.15"
+deserialize_form_style_query_parameter = "0.2.2"
+hashbrown = "0.16"
 lazy_static = "1.4"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

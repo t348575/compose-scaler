@@ -3,18 +3,19 @@ package traefik
 import (
 	"fmt"
 	"net/http"
-	"time"
 	"strings"
+	"time"
 )
 
 type Config struct {
-	ComposeScalerURL string  `yaml:"composeScalerUrl"`
-	Name             string  `yaml:"name"`
-	SessionDuration  string  `yaml:"sessionDuration"`
-	DisplayName      string  `yaml:"displayname"`
-	Theme            string  `yaml:"theme"`
-	RefreshFrequency string  `yaml:"refreshFrequency"`
-	CustomCommand    *string `yaml:"customCommand"`
+	ComposeScalerURL string   `yaml:"composeScalerUrl"`
+	Name             string   `yaml:"name"`
+	SessionDuration  string   `yaml:"sessionDuration"`
+	DisplayName      string   `yaml:"displayname"`
+	Theme            string   `yaml:"theme"`
+	RefreshFrequency string   `yaml:"refreshFrequency"`
+	CustomCommand    *string  `yaml:"customCommand"`
+	Only             []string `yaml:"only"`
 }
 
 func CreateConfig() *Config {
@@ -26,12 +27,13 @@ func CreateConfig() *Config {
 		Theme:            "ghost",
 		RefreshFrequency: "5s",
 		CustomCommand:    nil,
+		Only:             []string{},
 	}
 }
 
 func ToTitle(str string) string {
-    letters := strings.Split(str, "")
-    return strings.ToUpper(letters[0]) + strings.Join(letters[1:], "")
+	letters := strings.Split(str, "")
+	return strings.ToUpper(letters[0]) + strings.Join(letters[1:], "")
 }
 
 func (c *Config) BuildRequest(middlewareName string) (*http.Request, error) {
@@ -86,6 +88,10 @@ func (c *Config) BuildRequest(middlewareName string) (*http.Request, error) {
 
 	if c.CustomCommand != nil {
 		q.Add("custom_command", *c.CustomCommand)
+	}
+
+	if len(c.Only) > 0 {
+		q.Add("only", strings.Join(c.Only, ","))
 	}
 
 	request.URL.RawQuery = q.Encode()
