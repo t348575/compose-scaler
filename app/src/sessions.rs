@@ -7,12 +7,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use bollard::{service::HealthStatusEnum, Docker};
 use deserialize_form_style_query_parameter::option_form_vec_deserialize;
-use bollard::{
-    service::{ContainerStateStatusEnum, HealthStatusEnum},
-    Docker,
-};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Deserializer, Serialize};
 use ssh2::Session;
 use tera::Context;
@@ -30,6 +27,8 @@ const UNHEALTHY_NO_LOG: &str = "container is unhealthy: no log available";
 const DEAD_STATE: &str = "container in dead state";
 const DEFAULT_COMMAND: &str = "docker compose";
 const SESSION_CHANNEL_OPEN_ERR: &str = "Could not open session channel";
+const NO_CONTAINER_FOR_SERVICE: &str = "service has no container (never started or removed)";
+const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(from = "ParseConfig", into = "ParseConfig")]
@@ -95,7 +94,11 @@ impl From<Config> for ParseConfig {
             theme: value.theme,
             refresh_frequency: value.refresh_frequency,
             custom_command: value.custom_command,
-            only: if value.only.is_empty() { None } else { Some(value.only) },
+            only: if value.only.is_empty() {
+                None
+            } else {
+                Some(value.only)
+            },
         }
     }
 }
@@ -174,6 +177,7 @@ struct Project {
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct ContainerStatus {
     name: String,
+    container_id: Option<String>,
     running: bool,
     current_replicas: u8,
     desired_replicas: u8,
@@ -187,6 +191,7 @@ pub enum ContainerStateStatus {
     #[default]
     NotReady,
     Unrecoverable,
+    Missing,
 }
 
 impl Project {
@@ -229,7 +234,9 @@ pub enum ProjectError {
     #[error("Could not inspect container: {0}")]
     InspectError(String),
     #[error("Could not override project: {0}")]
-    OverrrideError(String),
+    OverrideError(String),
+    #[error("Unknown compose services in `only`: {0}")]
+    UnknownServices(String),
 }
 
 impl ProjectManager {
@@ -350,7 +357,7 @@ impl ProjectManager {
             }
             Ok(())
         } else {
-            return Err(ProjectError::OverrrideError("Project not found".to_owned()));
+            return Err(ProjectError::OverrideError("Project not found".to_owned()));
         }
     }
 
@@ -506,6 +513,7 @@ impl ProjectManager {
         command: &str,
         only: &[String],
     ) -> Result<(), ProjectError> {
+        self.validate_only_services(name, command, only)?;
         if let Err(err) = self.exec_command(name, &format!("{command} up -d {}", only.join(" "))) {
             match err {
                 SESSION_CHANNEL_OPEN_ERR => self.session = Self::connect_ssh(&self.c),
@@ -521,6 +529,7 @@ impl ProjectManager {
         command: &str,
         only: &[String],
     ) -> Result<(), ProjectError> {
+        self.validate_only_services(name, command, only)?;
         if let Err(err) = self.exec_command(name, &format!("{command} down {}", only.join(" "))) {
             return Err(ProjectError::StopError(err.to_owned()));
         }
@@ -533,79 +542,141 @@ impl ProjectManager {
         command: &str,
         only: &[String],
     ) -> Result<Vec<ContainerStatus>, ProjectError> {
-        match self.exec_command(name, &format!("{command} ps -q {}", only.join(" "))) {
-            Ok(output) => {
-                let mut statuses = Vec::new();
-                for item in output.split('\n') {
-                    let item = item.trim();
-                    if item.len() == 0 {
-                        continue;
-                    }
+        let declared_services_out = self
+            .exec_command(name, &format!("{command} config --services"))
+            .map_err(|err| ProjectError::ListError(err.to_string()))?;
+        let declared_services = parse_lines(&declared_services_out);
+        if !only.is_empty() {
+            let declared_set: hashbrown::HashSet<&str> =
+                declared_services.iter().map(|s| s.as_str()).collect();
+            let unknown: Vec<&str> = only
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|svc| !declared_set.contains(*svc))
+                .collect();
+            if !unknown.is_empty() {
+                return Err(ProjectError::UnknownServices(unknown.join(", ")));
+            }
+        }
 
-                    let status = self
-                        .docker
-                        .inspect_container(
-                            item,
-                            None::<bollard::query_parameters::InspectContainerOptions>,
-                        )
-                        .await
-                        .map_err(|x| ProjectError::InspectError(x.to_string()))?;
+        let mut declared_filtered = declared_services.clone();
+        if !only.is_empty() {
+            let only_set: HashSet<&str> = only.iter().map(|s| s.as_str()).collect();
+            declared_filtered.retain(|svc| only_set.contains(svc.as_str()));
+        }
+        let container_ids_out = self
+            .exec_command(name, &format!("{command} ps -q {}", only.join(" ")))
+            .map_err(|err| ProjectError::ListError(err.to_string()))?;
+        let container_ids = parse_lines(&container_ids_out);
+        let mut by_service = HashMap::new();
+        for svc in &declared_filtered {
+            by_service.insert(
+                svc.clone(),
+                ContainerStatus {
+                    name: svc.clone(),
+                    container_id: None,
+                    desired_replicas: 1,
+                    current_replicas: 0,
+                    running: false,
+                    status: ContainerStateStatus::Missing,
+                    error: NO_CONTAINER_FOR_SERVICE.to_owned(),
+                },
+            );
+        }
 
-                    statuses.push(ContainerStatus {
-                        name: item.to_owned(),
-                        desired_replicas: 1,
-                        ..Default::default()
-                    });
-                    let last = statuses.last_mut().unwrap();
-                    let state = status.state.unwrap();
-                    use ContainerStateStatusEnum::*;
-                    match state.status.unwrap() {
-                        CREATED | PAUSED | RESTARTING | REMOVING => not_ready_instance_state(last),
-                        RUNNING => match state.health {
-                            Some(h) => match h.status.unwrap() {
-                                HealthStatusEnum::HEALTHY => ready_instance_state(last),
-                                HealthStatusEnum::UNHEALTHY => {
-                                    unrecoverable_instance_state(last);
-                                    if let Some(log) = h.log {
-                                        if log.len() > 0 {
-                                            let l = log[0].clone();
-                                            last.error = format!(
-                                                "container is unhealthy: {} ({})",
-                                                l.output.unwrap_or_default(),
-                                                l.exit_code.unwrap_or_default()
-                                            )
-                                        } else {
-                                            last.error = UNHEALTHY_NO_LOG.to_owned();
-                                        }
-                                    } else {
-                                        last.error = UNHEALTHY_NO_LOG.to_owned();
-                                    }
+        for id in container_ids {
+            let inspect = self
+                .docker
+                .inspect_container(
+                    &id,
+                    None::<bollard::query_parameters::InspectContainerOptions>,
+                )
+                .await
+                .map_err(|x| ProjectError::InspectError(x.to_string()))?;
+
+            let service_name = inspect
+                .config
+                .as_ref()
+                .and_then(|c| c.labels.as_ref())
+                .and_then(|labels| labels.get(COMPOSE_SERVICE_LABEL))
+                .cloned()
+                .unwrap_or_else(|| id.clone());
+            if !only.is_empty() && !only.iter().any(|s| s == &service_name) {
+                continue;
+            }
+            let entry = by_service
+                .entry(service_name.clone())
+                .or_insert_with(|| ContainerStatus {
+                    name: service_name.clone(),
+                    container_id: Some(id.clone()),
+                    desired_replicas: 1,
+                    ..Default::default()
+                });
+
+            entry.name = service_name;
+            entry.container_id = Some(id.clone());
+            entry.desired_replicas = 1;
+            let state = match inspect.state {
+                Some(s) => s,
+                None => {
+                    not_ready_instance_state(entry);
+                    entry.error = "container has no state".to_owned();
+                    continue;
+                }
+            };
+
+            use bollard::service::ContainerStateStatusEnum::*;
+            match state.status.unwrap() {
+                CREATED | PAUSED | RESTARTING | REMOVING => not_ready_instance_state(entry),
+                RUNNING => match state.health {
+                    Some(h) => match h.status.unwrap() {
+                        HealthStatusEnum::HEALTHY => ready_instance_state(entry),
+                        HealthStatusEnum::UNHEALTHY => {
+                            unrecoverable_instance_state(entry);
+                            if let Some(log) = h.log {
+                                if !log.is_empty() {
+                                    let l = log[0].clone();
+                                    entry.error = format!(
+                                        "container is unhealthy: {} ({})",
+                                        l.output.unwrap_or_default(),
+                                        l.exit_code.unwrap_or_default()
+                                    );
+                                } else {
+                                    entry.error = UNHEALTHY_NO_LOG.to_owned();
                                 }
-                                _ => not_ready_instance_state(last),
-                            },
-                            None => ready_instance_state(last),
-                        },
-                        EXITED => {
-                            let exit_code = state.exit_code.unwrap_or_default();
-                            if exit_code != 0 {
-                                unrecoverable_instance_state(last);
-                                last.error =
-                                    format!(r#"container exited with code "{}""#, exit_code)
                             } else {
-                                not_ready_instance_state(last);
+                                entry.error = UNHEALTHY_NO_LOG.to_owned();
                             }
                         }
-                        DEAD => {
-                            unrecoverable_instance_state(last);
-                            last.error = DEAD_STATE.to_owned();
-                        }
-                        _ => unreachable!(),
+                        _ => not_ready_instance_state(entry),
+                    },
+                    None => ready_instance_state(entry),
+                },
+                EXITED => {
+                    let exit_code = state.exit_code.unwrap_or_default();
+                    if exit_code != 0 {
+                        unrecoverable_instance_state(entry);
+                        entry.error = format!(r#"container exited with code "{}""#, exit_code);
+                    } else {
+                        not_ready_instance_state(entry);
                     }
                 }
-                Ok(statuses)
+                DEAD => {
+                    unrecoverable_instance_state(entry);
+                    entry.error = DEAD_STATE.to_owned();
+                }
+                _ => unreachable!(),
             }
-            Err(err) => Err(ProjectError::ListError(err.to_string())),
         }
+
+        let mut result = Vec::new();
+        for svc in declared_filtered {
+            if let Some(s) = by_service.remove(&svc) {
+                result.push(s);
+            }
+        }
+        result.extend(by_service.into_values());
+        Ok(result)
     }
 
     pub fn get_all(&self) -> Vec<super::Project> {
@@ -621,11 +692,40 @@ impl ProjectManager {
             .collect()
     }
 
+    fn validate_only_services(
+        &self,
+        dir: &str,
+        command: &str,
+        only: &[String],
+    ) -> Result<(), ProjectError> {
+        if only.is_empty() {
+            return Ok(());
+        }
+
+        let declared_services_out = self
+            .exec_command(dir, &format!("{command} config --services"))
+            .map_err(|err| ProjectError::ListError(err.to_string()))?;
+        let declared = parse_lines(&declared_services_out);
+        let declared_set: hashbrown::HashSet<&str> = declared.iter().map(|s| s.as_str()).collect();
+        let unknown: Vec<&str> = only
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|svc| !declared_set.contains(*svc))
+            .collect();
+
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(ProjectError::UnknownServices(unknown.join(", ")))
+        }
+    }
+
     fn exec_command(&self, dir: &str, command: &str) -> Result<String, &'static str> {
         let mut channel = self
             .session
             .channel_session()
             .map_err(|_| SESSION_CHANNEL_OPEN_ERR)?;
+        debug!("cd {}/{dir} && {command}", self.c.projects_dir);
         channel
             .exec(&format!("cd {}/{dir} && {command}", self.c.projects_dir))
             .map_err(|_| "Could not execute command")?;
@@ -680,4 +780,12 @@ mod tests {
         let t: DTest = serde_json::from_str(test_str).expect("Could not parse json");
         assert_eq!(t.value, Duration::from_secs(6 * 60 * 60));
     }
+}
+
+fn parse_lines(s: &str) -> Vec<String> {
+    s.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_owned())
+        .collect()
 }

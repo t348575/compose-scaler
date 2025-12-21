@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use axum::{
-    Router, extract::{Path, Query, State}, http::StatusCode, response::{Html, IntoResponse}, routing::{get, post}
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::{get, post},
+    Router,
 };
 use clap::Parser;
 use config::Args;
@@ -67,7 +71,6 @@ async fn api_handler(
     Query(config): Query<Config>,
     State(manager): State<SharedProjectManager>,
 ) -> impl IntoResponse {
-    debug!("{config:#?}");
     if manager.read().await.has_override(&config.name)
         && !manager.read().await.is_running(&config.name)
     {
