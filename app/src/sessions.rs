@@ -63,6 +63,32 @@ pub struct ParseConfig {
     custom_command: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, Hash)]
+struct ProjectKey {
+    name: String,
+    only: Vec<String>,
+    command: String,
+}
+
+impl PartialEq for ProjectKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.only == other.only && self.command == other.command
+    }
+}
+
+impl ProjectKey {
+    fn from_config(c: &Config) -> Self {
+        let mut only = c.only.clone();
+        only.sort();
+        only.dedup();
+        Self {
+            name: c.name.clone(),
+            only,
+            command: c.command(),
+        }
+    }
+}
+
 fn capitalize_first(s: &str) -> String {
     s.chars()
         .take(1)
@@ -73,6 +99,9 @@ fn capitalize_first(s: &str) -> String {
 
 impl From<ParseConfig> for Config {
     fn from(value: ParseConfig) -> Self {
+        let mut only = value.only.unwrap_or_default();
+        only.sort();
+        only.dedup();
         Config {
             name: value.name.clone(),
             display_name: value.display_name.unwrap_or(capitalize_first(&value.name)),
@@ -80,7 +109,7 @@ impl From<ParseConfig> for Config {
             theme: value.theme,
             refresh_frequency: value.refresh_frequency,
             custom_command: value.custom_command,
-            only: value.only.unwrap_or_default(),
+            only,
         }
     }
 }
@@ -209,7 +238,7 @@ impl Project {
 
 pub type SharedProjectManager = Arc<RwLock<ProjectManager>>;
 pub struct ProjectManager {
-    projects: HashMap<String, Project>,
+    projects: HashMap<ProjectKey, Project>,
     docker: Docker,
     this: Option<SharedProjectManager>,
     session: Session,
@@ -261,24 +290,22 @@ impl ProjectManager {
 
         for c in c.projects {
             if let Ok(statuses) = pm.status_project(&c.name, &c.command(), &c.only).await {
-                let is_not_running = statuses.len() == 0 || statuses.iter().any(|x| !x.running);
+                let status = derive_project_status(&statuses);
+                let key = ProjectKey::from_config(&c);
+                debug!("Project {} has status: {:?}", c.name, status);
                 pm.projects.insert(
-                    c.name.clone(),
+                    key,
                     Project {
                         scale_override: false,
                         config: c,
-                        last_invoke: if is_not_running {
+                        last_invoke: if status == Status::NotRunning {
                             Instant::now() - Duration::from_secs(86400)
                         } else {
                             Instant::now()
                         },
                         handle: None,
                         instance_states: statuses,
-                        status: if is_not_running {
-                            Status::NotRunning
-                        } else {
-                            Status::Running
-                        },
+                        status,
                     },
                 );
             } else {
@@ -291,15 +318,15 @@ impl ProjectManager {
         pm
     }
 
-    pub fn has_override(&self, project: &str) -> bool {
+    pub fn has_override(&self, c: &Config) -> bool {
         self.projects
-            .get(project)
+            .get(&ProjectKey::from_config(c))
             .map_or(false, |p| p.scale_override)
     }
 
-    pub fn is_running(&self, project: &str) -> bool {
+    pub fn is_running(&self, c: &Config) -> bool {
         self.projects
-            .get(project)
+            .get(&ProjectKey::from_config(c))
             .map_or(false, |p| p.status == Status::Running)
     }
 
@@ -330,63 +357,87 @@ impl ProjectManager {
         project: String,
         command: OverrideCommand,
     ) -> Result<(), ProjectError> {
-        if let Some(p) = self.projects.get_mut(&project) {
-            match command {
-                OverrideCommand::Start => {
-                    p.scale_override = true;
-                    self.add_and_start(self.projects.get(&project).unwrap().config.clone())
-                        .await?;
-                }
-                OverrideCommand::Stop => {
-                    p.scale_override = true;
-                    p.status = Status::NotRunning;
-                    let c = &self.projects.get(&project).unwrap().config;
-                    if let Err(err) = self.stop_project(&project, &c.command(), &c.only).await {
-                        error!("(When stopping for idling) {err}");
+        let keys: Vec<ProjectKey> = self
+            .projects
+            .keys()
+            .filter(|k| k.name == project)
+            .cloned()
+            .collect();
+
+        if keys.is_empty() {
+            return Err(ProjectError::OverrideError("Project not found".to_owned()));
+        }
+
+        match command {
+            OverrideCommand::Start => {
+                for k in &keys {
+                    if let Some(p) = self.projects.get_mut(k) {
+                        p.scale_override = true;
+                        let cfg = p.config.clone();
+                        self.add_and_start(cfg).await?;
                     }
                 }
-                OverrideCommand::Clear => {
-                    p.scale_override = false;
-                    if let Status::NotRunning = p.status {
-                        p.last_invoke = Instant::now() - (p.config.session_duration * 2);
-                        if let Some(h) = p.handle.take() {
-                            h.abort();
+            }
+            OverrideCommand::Stop => {
+                for k in &keys {
+                    if let Some(p) = self.projects.get_mut(k) {
+                        p.scale_override = true;
+                        p.status = Status::NotRunning;
+                        let cfg = p.config.clone();
+                        if let Err(err) = self
+                            .stop_project(&cfg.name, &cfg.command(), &cfg.only)
+                            .await
+                        {
+                            error!("(When stopping for idling) {err}");
                         }
                     }
                 }
             }
-            Ok(())
-        } else {
-            return Err(ProjectError::OverrideError("Project not found".to_owned()));
+            OverrideCommand::Clear => {
+                for k in &keys {
+                    if let Some(p) = self.projects.get_mut(k) {
+                        p.scale_override = false;
+                        if let Status::NotRunning = p.status {
+                            p.last_invoke = Instant::now() - (p.config.session_duration * 2);
+                            if let Some(h) = p.handle.take() {
+                                h.abort();
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        Ok(())
     }
 
     pub async fn add_and_start(
         &mut self,
         config: Config,
     ) -> Result<(Status, Vec<ContainerStatus>), ProjectError> {
-        let project = if self.projects.contains_key(&config.name) {
-            let item = self.projects.get_mut(&config.name).unwrap();
+        let key = ProjectKey::from_config(&config);
+        let project = if self.projects.contains_key(&key) {
+            let item = self.projects.get_mut(&key).unwrap();
             item.config = config.clone();
             item
         } else {
             self.projects
-                .insert(config.name.clone(), Project::new(config.clone()));
-            self.projects.get_mut(&config.name).unwrap()
+                .insert(key.clone(), Project::new(config.clone()));
+            self.projects.get_mut(&key).unwrap()
         };
 
         if let Status::NotRunning = project.status {
             project.status = Status::Starting;
 
             let pc = self.this.clone().unwrap();
-            let name = config.name.clone();
+            let key_c = key.clone();
             spawn(async move {
                 if let Err(err) =
-                    Self::start_project_sequence(name.clone(), pc.clone(), config).await
+                    Self::start_project_sequence(key_c.clone(), pc.clone(), config).await
                 {
                     error!("Could not startup project: {err}");
 
-                    if let Some(p) = pc.write().await.projects.get_mut(&name) {
+                    if let Some(p) = pc.write().await.projects.get_mut(&key_c) {
                         p.status = Status::NotRunning;
                         if let Some(h) = &p.handle {
                             h.abort();
@@ -401,7 +452,7 @@ impl ProjectManager {
     }
 
     async fn start_project_sequence(
-        name: String,
+        key: ProjectKey,
         this: SharedProjectManager,
         config: Config,
     ) -> Result<(), ProjectError> {
@@ -409,7 +460,8 @@ impl ProjectManager {
 
         let cmd = config.command();
         for i in 0..3 {
-            if let Err(err) = m.start_project(&name, &cmd, &config.only).await {
+            debug!("Attempting to start project {}", config.name);
+            if let Err(err) = m.start_project(&config.name, &cmd, &config.only).await {
                 if i == 3 {
                     return Err(err);
                 }
@@ -418,17 +470,16 @@ impl ProjectManager {
             }
         }
 
-        let p = m.projects.get_mut(&name);
+        let p = m.projects.get_mut(&key);
         if p.is_none() {
             return Err(ProjectError::StartError("Project not found".to_owned()));
         }
         let p = p.unwrap();
         let this_c = this.clone();
-        let name_c = name.clone();
 
         let start_and_set_handle = |p: &mut Project| {
             let handle = spawn(async move {
-                Self::manage_project(name_c, this_c).await;
+                Self::manage_project(key, this_c).await;
             });
             p.handle = Some(handle);
         };
@@ -445,15 +496,16 @@ impl ProjectManager {
         Ok(())
     }
 
-    async fn manage_project(name: String, this: SharedProjectManager) {
+    async fn manage_project(key: ProjectKey, this: SharedProjectManager) {
         loop {
-            debug!("Checking project {name}");
+            debug!("Checking project {key:?}");
             let mut project_manager = this.write().await;
-            let p = match project_manager.projects.get_mut(&name) {
+            let p = match project_manager.projects.get_mut(&key) {
                 Some(p) => p,
                 None => break,
             };
 
+            let name = key.name.clone();
             let custom_command = p.config.command();
             let sleep_for = p.config.refresh_frequency;
             let only = p.config.only.clone();
@@ -479,24 +531,21 @@ impl ProjectManager {
                     .await
                 {
                     Ok(statuses) => {
-                        if statuses.len() == 0 || statuses.iter().position(|x| !x.running).is_some()
-                        {
+                        let derived = derive_project_status(&statuses);
+                        if derived != Status::Running {
                             if let Err(err) = project_manager
                                 .start_project(&name, &custom_command, &only)
                                 .await
                             {
-                                error!("(When restarting) {err}")
+                                error!("(When restarting) {err}");
                             } else {
-                                warn!("One or more containers in project {name} stopped");
-                            }
-                        } else {
-                            if let Some(p) = project_manager.projects.get_mut(&name) {
-                                p.status = Status::Running;
+                                warn!("One or more containers in project {key:?} not ready; restart attempted");
                             }
                         }
 
-                        if let Some(p) = project_manager.projects.get_mut(&name) {
+                        if let Some(p) = project_manager.projects.get_mut(&key) {
                             p.instance_states = statuses;
+                            p.status = derived;
                         }
                     }
                     Err(err) => error!("(When refreshing) {err}"),
@@ -788,4 +837,28 @@ fn parse_lines(s: &str) -> Vec<String> {
         .filter(|l| !l.is_empty())
         .map(|l| l.to_owned())
         .collect()
+}
+
+fn derive_project_status(states: &[ContainerStatus]) -> Status {
+    if states.is_empty() {
+        return Status::NotRunning;
+    }
+
+    if states.iter().any(|s| {
+        matches!(
+            s.status,
+            ContainerStateStatus::Missing | ContainerStateStatus::Unrecoverable
+        )
+    }) {
+        return Status::NotRunning;
+    }
+
+    if states
+        .iter()
+        .all(|s| s.running && matches!(s.status, ContainerStateStatus::Ready))
+    {
+        Status::Running
+    } else {
+        Status::Starting
+    }
 }

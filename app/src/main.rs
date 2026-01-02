@@ -13,7 +13,8 @@ use lazy_static::lazy_static;
 use sessions::{Config, OverrideCommand, SharedProjectManager};
 use tera::{Context, Tera};
 use tokio::{signal, sync::RwLock};
-use tracing::{debug, error};
+use tower_http::trace::{self, TraceLayer};
+use tracing::{debug, error, Level};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::sessions::ProjectManager;
@@ -43,6 +44,11 @@ async fn main() {
     let app = Router::new()
         .nest("/api", api_router)
         .route("/projects", get(project_handler))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(trace::DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(trace::DefaultOnResponse::new().level(Level::INFO)),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.address)
@@ -71,9 +77,7 @@ async fn api_handler(
     Query(config): Query<Config>,
     State(manager): State<SharedProjectManager>,
 ) -> impl IntoResponse {
-    if manager.read().await.has_override(&config.name)
-        && !manager.read().await.is_running(&config.name)
-    {
+    if manager.read().await.has_override(&config) && !manager.read().await.is_running(&config) {
         return (StatusCode::CONFLICT, "Project has an override").into_response();
     }
 

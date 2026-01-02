@@ -81,5 +81,5 @@ http:
           # if required, pass a path to a custom docker compose, eg. overleaf uses one
           # the default is "docker compose"
           customCommand: bin/docker-compose
-          only: [dockge] # only apply this to the "dockge" service, other services in the docker-compose will remain unaffected. By default all services are affected.
+          only: dockge # only apply this to the "dockge" service, other services in the docker-compose will remain unaffected. By default all services are affected.
 ```
