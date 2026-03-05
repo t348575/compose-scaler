@@ -9,7 +9,6 @@ edition = "2021"
 axum = { version = "0.8", features = ["http2", "query", "json"] }
 bollard = "0.19"
 clap = { version = "4.4", features = ["derive"] }
-deserialize_form_style_query_parameter = "0.2.2"
 hashbrown = "0.16"
 lazy_static = "1.4"
 serde = { version = "1", features = ["derive"] }

@@ -8,8 +8,8 @@ use std::{
 };
 
 use bollard::{service::HealthStatusEnum, Docker};
-use deserialize_form_style_query_parameter::option_form_vec_deserialize;
 use hashbrown::{HashMap, HashSet};
+use serde::de::SeqAccess;
 use serde::{Deserialize, Deserializer, Serialize};
 use ssh2::Session;
 use tera::Context;
@@ -45,7 +45,7 @@ pub struct Config {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ParseConfig {
     name: String,
-    #[serde(deserialize_with = "option_form_vec_deserialize", default)]
+    #[serde(deserialize_with = "option_string_or_seq_deserialize", default)]
     only: Option<Vec<String>>,
     display_name: Option<String>,
     #[serde(
@@ -130,6 +130,48 @@ impl From<Config> for ParseConfig {
             },
         }
     }
+}
+
+fn option_string_or_seq_deserialize<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrSeq;
+
+    impl<'de> serde::de::Visitor<'de> for StringOrSeq {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a comma-separated string or a sequence of strings")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            if v.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            Ok(Some(v.split(',').map(|s| s.trim().to_owned()).collect()))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut vec = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                vec.push(s);
+            }
+            Ok(Some(vec))
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrSeq)
 }
 
 fn default_theme() -> String {
