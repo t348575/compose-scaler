@@ -45,12 +45,12 @@ private_key: /compose_scaler_key
 projects:
   - name: gitea
     name: dockge # this must match the folder name inside your compose projects directory
-    displayName: Dockge # displayed on the waiting page
-    refreshFrequency: 5s # how often to refresh status, etc.
-    sessionDuration: 5m # time before running docker compose down
+    display_name: Dockge # displayed on the waiting page
+    refresh_frequency: 5s # how often to refresh status, etc.
+    session_duration: 5m # time before running docker compose down
     # if required, pass a path to a custom docker compose, eg. overleaf uses one
     # the default is "docker compose"
-    customCommand: bin/docker-compose
+    custom_command: bin/docker-compose
 ```
 
 * Expected compose projects directory structure:
