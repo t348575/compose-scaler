@@ -770,6 +770,38 @@ impl ProjectManager {
         Ok(result)
     }
 
+    pub async fn refresh_all(&mut self) {
+        for cfg in self.c.projects.clone() {
+            let statuses = match self.status_project(&cfg.name, &cfg.command(), &cfg.only).await {
+                Ok(statuses) => statuses,
+                Err(err) => {
+                    error!("(When force-refreshing {}) {err}", cfg.name);
+                    continue;
+                }
+            };
+            let derived = derive_project_status(&statuses);
+            debug!("Force-refreshed {} to status: {derived:?}", cfg.name);
+
+            let key = ProjectKey::from_config(&cfg);
+            let this = self.this.clone();
+            let p = self
+                .projects
+                .entry(key.clone())
+                .or_insert_with(|| Project::new(cfg.clone()));
+            p.instance_states = statuses;
+
+            let unmanaged = p.handle.as_ref().map_or(true, |h| h.is_finished());
+            if derived == Status::Running && !p.scale_override && unmanaged {
+                // Must precede the spawn: manage_project stops the project on its
+                // first tick if last_invoke is already older than session_duration.
+                p.last_invoke = Instant::now();
+                let this = this.expect("set_this was not called");
+                p.handle = Some(spawn(async move { Self::manage_project(key, this).await }));
+            }
+            p.status = derived;
+        }
+    }
+
     pub fn get_all(&self) -> Vec<super::Project> {
         self.projects
             .iter()

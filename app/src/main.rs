@@ -39,7 +39,8 @@ async fn main() {
 
     let api_router = Router::new()
         .route("/scale", get(api_handler))
-        .route("/override/{project}/{scale}", post(scale_commands));
+        .route("/override/{project}/{scale}", post(scale_commands))
+        .route("/refresh", post(refresh_handler));
 
     let app = Router::new()
         .nest("/api", api_router)
@@ -121,6 +122,11 @@ async fn scale_commands(
         Ok(()) => StatusCode::OK.into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     }
+}
+
+async fn refresh_handler(State(manager): State<SharedProjectManager>) -> impl IntoResponse {
+    manager.write().await.refresh_all().await;
+    StatusCode::OK
 }
 
 async fn shutdown_signal() {
