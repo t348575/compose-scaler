@@ -490,6 +490,14 @@ impl ProjectManager {
         }
 
         project.last_invoke = Instant::now();
+
+        if project.status == Status::Running
+            && project.handle.as_ref().map_or(true, |h| h.is_finished())
+        {
+            let this = self.this.clone().expect("set_this was not called");
+            project.handle = Some(spawn(async move { Self::manage_project(key, this).await }));
+        }
+
         Ok((project.status.clone(), project.instance_states.clone()))
     }
 
@@ -782,22 +790,11 @@ impl ProjectManager {
             let derived = derive_project_status(&statuses);
             debug!("Force-refreshed {} to status: {derived:?}", cfg.name);
 
-            let key = ProjectKey::from_config(&cfg);
-            let this = self.this.clone();
             let p = self
                 .projects
-                .entry(key.clone())
+                .entry(ProjectKey::from_config(&cfg))
                 .or_insert_with(|| Project::new(cfg.clone()));
             p.instance_states = statuses;
-
-            let unmanaged = p.handle.as_ref().map_or(true, |h| h.is_finished());
-            if derived == Status::Running && !p.scale_override && unmanaged {
-                // Must precede the spawn: manage_project stops the project on its
-                // first tick if last_invoke is already older than session_duration.
-                p.last_invoke = Instant::now();
-                let this = this.expect("set_this was not called");
-                p.handle = Some(spawn(async move { Self::manage_project(key, this).await }));
-            }
             p.status = derived;
         }
     }
